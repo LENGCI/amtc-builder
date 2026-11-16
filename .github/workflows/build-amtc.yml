@@ -1,0 +1,125 @@
+name: Build amtc for ImmortalWrt
+
+on:
+  workflow_dispatch:
+    inputs:
+      ssh_debug:
+        description: '是否开启 SSH 调试(失败时/手动开启后可远程登录)'
+        required: false
+        default: 'false'
+        type: boolean
+
+env:
+  IMMORTALWRT_REPO: https://github.com/immortalwrt/immortalwrt.git
+  IMMORTALWRT_BRANCH: openwrt-25.12   # 对应你 25.12.2 使用的分支
+  TARGET: x86
+  SUBTARGET: 64
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 检出仓库(存放自定义 Makefile)
+        uses: actions/checkout@v4
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt update
+          sudo apt install -y build-essential clang flex g++ gawk gcc-multilib \
+            g++-multilib gettext git libncurses5-dev libssl-dev python3-setuptools \
+            rsync swig unzip zlib1g-dev file wget
+
+      - name: 克隆 ImmortalWrt 源码
+        run: |
+          git clone --branch $IMMORTALWRT_BRANCH --depth 1 $IMMORTALWRT_REPO immortalwrt
+
+      - name: 更新 feeds
+        working-directory: immortalwrt
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 写入 amtc 的 package Makefile
+        run: |
+          mkdir -p immortalwrt/package/network/utils/amtc
+          cat > immortalwrt/package/network/utils/amtc/Makefile <<'EOF'
+          include $(TOPDIR)/rules.mk
+
+          PKG_NAME:=amtc
+          PKG_VERSION:=0.8.5
+          PKG_RELEASE:=1
+
+          PKG_SOURCE_PROTO:=git
+          PKG_SOURCE_URL:=https://github.com/schnoddelbotz/amtc.git
+          PKG_SOURCE_VERSION:=master
+          PKG_SOURCE_SUBDIR:=$(PKG_NAME)-$(PKG_VERSION)
+          PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
+          PKG_MIRROR_HASH:=skip
+
+          PKG_MAINTAINER:=you@example.com
+          PKG_LICENSE:=GPL-2.0
+
+          PKG_BUILD_PARALLEL:=1
+
+          include $(INCLUDE_DIR)/package.mk
+
+          define Package/amtc
+            SECTION:=net
+            CATEGORY:=Network
+            TITLE:=Intel AMT/vPro mass remote power management tool
+            DEPENDS:=+libcurl +libgnutls +libpthread
+          endef
+
+          define Package/amtc/description
+            Lightweight CLI tool for Intel AMT/vPro out-of-band power management.
+          endef
+
+          define Build/Compile
+          	$(MAKE) -C $(PKG_BUILD_DIR)/src \
+          		CC="$(TARGET_CC)" \
+          		CFLAGS="$(TARGET_CFLAGS) -I$(STAGING_DIR)/usr/include" \
+          		LDFLAGS="$(TARGET_LDFLAGS) -L$(STAGING_DIR)/usr/lib" \
+          		amtc
+          endef
+
+          define Package/amtc/install
+          	$(INSTALL_DIR) $(1)/usr/sbin
+          	$(INSTALL_BIN) $(PKG_BUILD_DIR)/src/amtc $(1)/usr/sbin/amtc
+          endef
+
+          $(eval $(call BuildPackage,amtc))
+          EOF
+
+      - name: 生成最小 defconfig(x86/64 + amtc)
+        working-directory: immortalwrt
+        run: |
+          make defconfig
+          echo "CONFIG_TARGET_x86=y" >> .config
+          echo "CONFIG_TARGET_x86_64=y" >> .config
+          echo "CONFIG_TARGET_x86_64_DEVICE_generic=y" >> .config
+          echo "CONFIG_PACKAGE_amtc=m" >> .config
+          make defconfig
+
+      - name: 下载依赖源码包
+        working-directory: immortalwrt
+        run: make download -j8 V=s
+
+      # ---- 可选调试:开启后会在这里挂起,给你 SSH 地址 ----
+      - name: SSH 调试(可选)
+        if: ${{ github.event.inputs.ssh_debug == 'true' }}
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit-access-to-actor: true
+
+      - name: 编译 amtc 包
+        working-directory: immortalwrt
+        run: make package/amtc/compile V=s -j$(nproc)
+
+      - name: 查找生成的 ipk
+        run: find immortalwrt/bin/ -name "amtc*.ipk"
+
+      - name: 上传 ipk 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: amtc-ipk
+          path: immortalwrt/bin/**/amtc*.ipk
