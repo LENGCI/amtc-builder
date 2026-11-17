@@ -104,6 +104,14 @@ jobs:
         working-directory: immortalwrt
         run: make download -j8 V=s
 
+      - name: 构建 host 工具链(sed/tar/patch 等)
+        working-directory: immortalwrt
+        run: make tools/install -j$(nproc) V=s
+
+      - name: 构建交叉编译工具链(gcc/binutils 等)
+        working-directory: immortalwrt
+        run: make toolchain/install -j$(nproc) V=s
+        
       # ---- 可选调试:开启后会在这里挂起,给你 SSH 地址 ----
       - name: SSH 调试(可选)
         if: ${{ github.event.inputs.ssh_debug == 'true' }}
