@@ -108,7 +108,7 @@ jobs:
       - name: SSH 调试(可选)
         if: ${{ github.event.inputs.ssh_debug == 'true' }}
         uses: lhotari/action-upterm@v1
-        timeout-minutes: 10
+        timeout-minutes: 180
         with:
           limit-access-to-actor: true
 
