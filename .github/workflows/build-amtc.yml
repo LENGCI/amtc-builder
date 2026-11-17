@@ -108,6 +108,7 @@ jobs:
       - name: SSH 调试(可选)
         if: ${{ github.event.inputs.ssh_debug == 'true' }}
         uses: mxschmitt/action-tmate@v3
+        timeout-minutes: 10
         with:
           limit-access-to-actor: true
 
