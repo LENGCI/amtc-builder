@@ -1,0 +1,70 @@
+#!/usr/bin/env perl
+#
+# Minimal drop-in replacement for "xxd -i <infile> <outfile>" (vim-common).
+#
+# amtc's src/Makefile embeds all WSMan SOAP request bodies (cmd_*, wsman_*)
+# and the usage text (amtc_usage) into the binary via:
+#     xxd -i <file> <file>.h
+# OpenWrt/ImmortalWrt ships its own "xxd" in staging_dir/host/bin, but that is
+# scripts/xxdi.pl which writes to stdout and ignores the second argument, so it
+# is not usable here. This shim keeps the upstream Makefile untouched and only
+# needs perl, which any OpenWrt build host has anyway.
+#
+use strict;
+use warnings;
+
+my ($outfile, $infile);
+
+if (@ARGV >= 2 && $ARGV[0] eq '-i') {
+	# xxd -i <infile> <outfile>
+	$infile  = $ARGV[1];
+	$outfile = $ARGV[2];
+} elsif (@ARGV == 1) {
+	# xxd <infile>
+	$infile = $ARGV[0];
+} else {
+	die "usage: xxd [-i] <infile> [<outfile>]\n";
+}
+
+die "xxd: $infile: No such file\n" unless -f $infile;
+
+my $var = $infile;
+$var =~ s{^.*/}{};		# strip any directory part
+$var =~ s/[^A-Za-z0-9_]/_/g;	# keep C identifier safe
+$var = "__$var" if $var =~ /^\d/;
+
+open(my $fh, '<:raw', $infile) or die "xxd: cannot open $infile: $!\n";
+local $/;
+my $data = <$fh>;
+close($fh);
+my $len = length($data);
+
+my $out;
+if (defined $outfile) {
+	$out = "unsigned char $var\[] = {\n";
+} else {
+	$out = "";
+}
+
+my $per_line = 12;
+for (my $i = 0; $i < $len; $i += $per_line) {
+	my @chunk = split //, substr($data, $i, $per_line);
+	my $line = "  " . join(", ", map { sprintf("0x%02x", ord($_)) } @chunk);
+	$line .= "," unless $i + $per_line >= $len;
+	$out .= "$line\n";
+}
+if ($len == 0) {
+	$out .= "  \n";
+}
+
+if (defined $outfile) {
+	$out .= "};\nunsigned int $var\_len = $len;\n";
+	open(my $ofh, '>:raw', $outfile) or die "xxd: cannot write $outfile: $!\n";
+	print $ofh $out;
+	close($ofh);
+} else {
+	binmode STDOUT;
+	print $out;
+}
+
+exit 0;

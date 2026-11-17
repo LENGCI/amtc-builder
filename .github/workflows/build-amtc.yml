@@ -1,61 +1,179 @@
-name: Build amtc for ImmortalWrt
+name: build-amtc
 
+# 在官方 ImmortalWrt SDK 里交叉编译 amtc（Intel AMT / vPro 批量管理 CLI），
+# 产出可直接在路由器上安装的包：
+#   25.12.x  ->  apk（ImmortalWrt >= 25.12 已经改用 apk，ipk 装不上）
+#   24.10.x  ->  ipk（opkg）
+#
+# 本文件是自包含的：不需要仓库里有其它文件。如果你更愿意把包定义放在
+# package/amtc/ 里维护，本 workflow 也会优先使用仓库里的那一份（见 “Stage package”）。
 on:
   workflow_dispatch:
     inputs:
-      ssh_debug:
-        description: '是否开启 SSH 调试(一般不需要了,仅作最后手段保留)'
-        required: false
-        default: 'false'
-        type: boolean
+      immortalwrt_version:
+        description: "ImmortalWrt 版本号（25.12.2 = apk；24.10.6 = ipk）"
+        required: true
+        default: "25.12.2"
+      targets:
+        description: "目标平台，逗号分隔的 board/subtarget（例如 x86/64, ramips/mt7621）"
+        required: true
+        default: "x86/64, armsr/armv8, mediatek/filogic, ramips/mt7621"
+  push:
+    branches: [main, master]
+    paths:
+      - ".github/workflows/build-amtc.yml"
+      - "package/**"
 
-env:
-  IMMORTALWRT_REPO: https://github.com/immortalwrt/immortalwrt.git
-  IMMORTALWRT_BRANCH: openwrt-25.12
-  TARGET: x86
-  SUBTARGET: 64
+permissions:
+  contents: read
 
 jobs:
-  build:
-    runs-on: ubuntu-22.04
+  # ---------------------------------------------------------------------------
+  # 把逗号分隔的 targets 变成 matrix
+  # ---------------------------------------------------------------------------
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
     steps:
-      - name: 检出仓库(存放自定义 Makefile)
-        uses: actions/checkout@v4
-
-      - name: 安装编译依赖
+      - name: Build matrix
+        id: gen
+        shell: bash
+        env:
+          TARGETS: ${{ inputs.targets || 'x86/64, armsr/armv8, mediatek/filogic, ramips/mt7621' }}
         run: |
-          sudo apt update
-          sudo apt install -y build-essential clang flex g++ gawk gcc-multilib \
-            g++-multilib gettext git libncurses5-dev libssl-dev python3-setuptools \
-            rsync swig unzip zlib1g-dev file wget xxd perl pandoc
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          raw = os.environ.get("TARGETS") or "x86/64"
+          items = []
+          for t in raw.split(","):
+              t = t.strip().strip("/")
+              if not t:
+                  continue
+              if t.count("/") != 1:
+                  raise SystemExit(f"目标格式不对: '{t}'，应为 board/subtarget，例如 x86/64")
+              items.append({"target": t, "slug": t.replace("/", "-")})
+          print("matrix=" + json.dumps({"include": items}))
+          PY
 
-      - name: 克隆 ImmortalWrt 源码
+  # ---------------------------------------------------------------------------
+  # 交叉编译
+  # ---------------------------------------------------------------------------
+  build:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    name: amtc ${{ matrix.target }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    env:
+      IWRT_VERSION: ${{ inputs.immortalwrt_version || '25.12.2' }}
+      TARGET: ${{ matrix.target }}
+      SLUG: ${{ matrix.slug }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 清理磁盘空间
         run: |
-          git clone --branch $IMMORTALWRT_BRANCH --depth 1 $IMMORTALWRT_REPO immortalwrt
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      /usr/lib/jvm /usr/local/lib/node_modules || true
+          sudo apt-get clean
+          df -h /
 
-      - name: 缓存工具链与下载包(重点:控制体积,避免重复编译)
+      - name: 安装主机构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential g++ file rsync gawk zstd xz-utils git curl \
+            ca-certificates unzip python3 perl libncurses-dev bc
+
+      # SDK 压缩包约 0.6 GB，缓存起来可以让重跑快很多
+      - name: 缓存 SDK 压缩包
         uses: actions/cache@v4
         with:
-          path: |
-            immortalwrt/dl
-            immortalwrt/staging_dir/host
-            immortalwrt/staging_dir/toolchain-*
-            immortalwrt/build_dir/host*
-            immortalwrt/build_dir/toolchain-*
-          key: immortalwrt-toolchain-${{ env.TARGET }}-${{ env.SUBTARGET }}-${{ hashFiles('**/.config') }}
-          restore-keys: |
-            immortalwrt-toolchain-${{ env.TARGET }}-${{ env.SUBTARGET }}-
+          path: sdk-dl
+          key: iwrt-sdk-${{ env.IWRT_VERSION }}-${{ env.SLUG }}
 
-      - name: 更新 feeds
-        working-directory: immortalwrt
+      - name: 下载 ImmortalWrt SDK
         run: |
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
+          set -euo pipefail
+          mkdir -p sdk-dl
+          base="https://downloads.immortalwrt.org/releases/${IWRT_VERSION}/targets/${TARGET}/"
+          echo "SDK 目录: $base"
+          listing=$(curl -fsSL --retry 3 "$base") || {
+            echo "::error::打不开 $base —— 版本号或 target/subtarget 填错了？"; exit 1; }
+          # 不写死 gcc 版本，直接从目录列表里取 SDK 文件名
+          sdk=$(printf '%s' "$listing" \
+            | grep -oE 'immortalwrt-sdk-[^"<> ]+\.Linux-x86_64\.tar\.(zst|xz)' \
+            | sort -u | head -n1)
+          if [ -z "$sdk" ]; then
+            echo "::error::${TARGET} 在 ${IWRT_VERSION} 下没有 SDK"
+            printf '%s' "$listing" | grep -oE 'immortalwrt-sdk[^"<> ]*' | head -n5 || true
+            exit 1
+          fi
+          echo "SDK: $sdk"
+          if [ ! -s "sdk-dl/$sdk" ]; then
+            curl -fL --retry 3 -o "sdk-dl/$sdk.part" "$base$sdk"
+            mv "sdk-dl/$sdk.part" "sdk-dl/$sdk"
+          fi
+          ls -lh sdk-dl/
 
-      - name: 写入 amtc 的 package Makefile
+      - name: 解压 SDK
         run: |
-          mkdir -p immortalwrt/package/network/utils/amtc
-          cat > immortalwrt/package/network/utils/amtc/Makefile <<'EOF'
+          set -euo pipefail
+          mkdir -p sdk
+          shopt -s nullglob
+          for f in sdk-dl/*.tar.zst; do tar --zstd -xf "$f" -C sdk; done
+          for f in sdk-dl/*.tar.xz;  do tar -xJf   "$f" -C sdk; done
+          sdk_dir=$(find sdk -maxdepth 1 -mindepth 1 -type d -name 'immortalwrt-sdk-*' | head -n1)
+          [ -n "$sdk_dir" ] || { echo "::error::SDK 解压失败"; exit 1; }
+          echo "SDK_DIR=$PWD/$sdk_dir" >> "$GITHUB_ENV"
+          if [ -x "$sdk_dir/staging_dir/host/bin/apk" ]; then
+            echo "这是 apk 系 SDK（ImmortalWrt >= 25.12），将产出 .apk"
+          else
+            echo "这是 opkg 系 SDK（ImmortalWrt <= 24.10），将产出 .ipk"
+          fi
+          df -h /
+
+      - name: 更新 feeds（libcurl 及其依赖来自这里）
+        run: |
+          set -euo pipefail
+          cd "$SDK_DIR"
+          ./scripts/feeds update base packages
+          # -a 会把两个 feed 里所有包定义都链进 package/feeds/，
+          # 这样 libcurl 的依赖链（openssl / zlib / ca-bundle ...）才认得全
+          ./scripts/feeds install -a || true
+          ls -d package/feeds/*
+
+      # 仓库里没有 package/amtc/ 时，就把包定义内联生成出来（本文件自包含的关键）
+      - name: Stage package（仓库里有就用仓库的，没有就内联生成）
+        run: |
+          set -euo pipefail
+          dst="$SDK_DIR/package/amtc"
+          rm -rf "$dst"
+          if [ -f "$GITHUB_WORKSPACE/package/amtc/Makefile" ]; then
+            echo "使用仓库里的 package/amtc/"
+            cp -a "$GITHUB_WORKSPACE/package/amtc" "$dst"
+          else
+            echo "仓库里没有 package/amtc/，使用内联定义"
+            mkdir -p "$dst/host-tools"
+            cat > "$dst/Makefile" <<'AMTC_MAKEFILE'
+          #
+          # OpenWrt / ImmortalWrt package for amtc
+          #   https://github.com/schnoddelbotz/amtc
+          #
+          # Intel AMT / vPro mass management CLI (one thread per host), including
+          # serial-over-LAN via the bundled GPL'ed amtterm code.
+          #
+          # Verified with the ImmortalWrt 25.12.2 (apk) SDK and gcc 14 / musl.
+          #
+          # Directory of this package (has to be evaluated before anything else is
+          # included, $(MAKEFILE_LIST) is clobbered by the build system's includes).
+          AMTC_PKGDIR:=$(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
+
           include $(TOPDIR)/rules.mk
 
           PKG_NAME:=amtc
@@ -64,106 +182,235 @@ jobs:
 
           PKG_SOURCE_PROTO:=git
           PKG_SOURCE_URL:=https://github.com/schnoddelbotz/amtc.git
-          PKG_SOURCE_VERSION:=master
-          PKG_SOURCE_SUBDIR:=$(PKG_NAME)-$(PKG_VERSION)
-          PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
+          PKG_SOURCE_VERSION:=4c2a69adea0a61534fd34aa691ffbc3dfa37bdbd
           PKG_MIRROR_HASH:=skip
 
-          PKG_MAINTAINER:=you@example.com
-          PKG_LICENSE:=GPL-2.0
+          # The repo has a .gitmodules pointing at git://git.kraxel.org/amtterm, which
+          # does not resolve any more. OpenWrt would try to "git submodule update" and
+          # die, so tell it to skip submodules - we fetch amtterm ourselves below.
+          PKG_SOURCE_SUBMODULES:=skip
 
-          PKG_BUILD_PARALLEL:=1
+          # amtc itself is MIT licensed, but its serial-over-LAN support statically
+          # links amtterm (GPL-2.0-only), so the resulting binary is GPL-2.0-only.
+          PKG_LICENSE:=MIT GPL-2.0-only
+          PKG_LICENSE_FILES:=LICENSE.txt
+          PKG_MAINTAINER:=
+
+          # We link against libcurl, so curl has to be built (and installed into
+          # staging_dir) before us. A plain DEPENDS:=+libcurl only adds a *runtime*
+          # dependency - "make package/amtc/compile" would happily try to compile
+          # amtc.c without curl/curl.h being present. "curl" here is the source package
+          # name (it builds libcurl4, which provides the virtual name "libcurl").
+          PKG_BUILD_DEPENDS:=curl
+
+          # amtterm, the submodule amtc expects, taken from the upstream GitHub mirror.
+          # The commit below is exactly the one recorded in amtc's git tree (v1.4).
+          # Do NOT bump this to amtterm 1.8: redir.h there includes <stdbool.h>, which
+          # collides with amtc's own "typedef enum { false, true } bool;".
+          AMTTERM_URL:=https://github.com/kraxel/amtterm.git
+          AMTTERM_COMMIT:=a75e48e010e92dc5540e2142efc445ccb0ab1a42
 
           include $(INCLUDE_DIR)/package.mk
+
+          # Host helper dir (contains the "xxd" shim), put in front of the build PATH.
+          TARGET_PATH_PKG:=$(AMTC_PKGDIR)/host-tools:$(TARGET_PATH_PKG)
 
           define Package/amtc
             SECTION:=net
             CATEGORY:=Network
-            TITLE:=Intel AMT/vPro mass remote power management tool
-            DEPENDS:=+libcurl +libgnutls +libpthread
+            TITLE:=Threaded Intel AMT/vPro mass management tool
+            URL:=https://github.com/schnoddelbotz/amtc
+            DEPENDS:=+libcurl +libpthread
           endef
 
           define Package/amtc/description
-            Lightweight CLI tool for Intel AMT/vPro out-of-band power management.
+           amtc is a threaded Intel AMT (vPro) mass management command line tool.
+           It powers machines on/off/reset/cycle, queries hardware info, sets the
+           next boot device (PXE/HDD), toggles AMT features (redirection, web UI,
+           ping replies, graceful shutdown) and opens a serial-over-LAN console -
+           for a single host or for a whole list of hosts in parallel.
           endef
 
-          AMTC_HEADERS:=amtc_usage cmd_powerdown cmd_powerup cmd_info cmd_powerreset \
-          	cmd_powercycle wsman_info wsman_info_step2 wsman_up wsman_down \
-          	wsman_reset wsman_xenum wsman_xenum_step2 wsman_pxeboot wsman_hddboot wsman_bootconfig \
-          	wsman_solredir_enable wsman_solredir_disable \
-          	wsman_webui_enable wsman_webui_disable \
-          	wsman_ping_enable wsman_ping_disable \
-          	wsman_shutdown_graceful wsman_reset_graceful
+          define Build/Prepare
+          	$(call Build/Prepare/Default)
+          	# src/Makefile expects src/amtterm to be a checked out submodule and
+          	# stops with "git submodule update" if src/amtterm/.git is missing.
+          	rm -rf $(PKG_BUILD_DIR)/src/amtterm
+          	git clone --quiet $(AMTTERM_URL) $(PKG_BUILD_DIR)/src/amtterm
+          	cd $(PKG_BUILD_DIR)/src/amtterm && git checkout --quiet $(AMTTERM_COMMIT)
+          endef
 
+          # Upstream has neither configure nor CMake, so drive src/Makefile directly with
+          # the OpenWrt toolchain.
+          #
+          #  * TARGET_PATH_PKG is prefixed with host-tools/: the "xxd" that OpenWrt
+          #    ships in staging_dir/host/bin is scripts/xxdi.pl, which does not support
+          #    xxd's output-file argument, so a small perl shim is put in front of it.
+          #  * -Wno-implicit-function-declaration: gcc >= 14 turns implicit function
+          #    declarations into a hard error; amtc.c calls amtterm_session() before it
+          #    is defined (the prototype only comes in later via amtc-amtterm.c).
           define Build/Compile
-          	export PATH="$$$$PATH:/usr/bin:/bin"; \
-          	cd $(PKG_BUILD_DIR)/src; \
-          	rm -rf amtterm; \
-          	git clone --depth 1 https://github.com/kraxel/amtterm.git amtterm; \
-          	sed -e '1,/\* ----/d' -e '/static void usage/,1000d' amtterm/amtterm.c > amtc-amtterm.c; \
-          	AMTCV=`cat ../version`; \
-          	cp amtc_usage amtc_usage.bak; \
-          	perl -pi -e "s/#AMTCV#/$$$$AMTCV/" amtc_usage; \
-          	for H in $(AMTC_HEADERS); do \
-          		xxd -i "$$$$H" "$$$$H.h"; \
-          	done; \
-          	mv amtc_usage.bak amtc_usage; \
-          	cat amtc_usage.h cmd_*.h wsman_*.h wsman.h > amt.h; \
-          	perl -pi -e 's/(0x\S\S)$$$$/$$$$1, 0x00/' amt.h; \
-          	perl -pi -e 's/(\d+);$$$$/$$$$1 + 1 .";"/e' amt.h; \
-          	$(TARGET_CC) $(TARGET_CFLAGS) -I. -I$(STAGING_DIR)/usr/include \
-          		-DWITH_GPL_AMTTERM \
-          		amtterm/tcp.c amtterm/redir.c amtc-amtterm.c amtc.c \
-          		$(TARGET_LDFLAGS) -L$(STAGING_DIR)/usr/lib -lcurl -lpthread \
-          		-o amtc
+          	$(MAKE) -C $(PKG_BUILD_DIR)/src \
+          		CC="$(TARGET_CC)" \
+          		CFLAGS="$(TARGET_CPPFLAGS) $(TARGET_CFLAGS) -Wno-implicit-function-declaration" \
+          		LDLIBS="$(TARGET_LDFLAGS) -lcurl -lpthread" \
+          		amtc
           endef
 
           define Package/amtc/install
-          	$(INSTALL_DIR) $(1)/usr/sbin
-          	$(INSTALL_BIN) $(PKG_BUILD_DIR)/src/amtc $(1)/usr/sbin/amtc
+          	$(INSTALL_DIR) $(1)/usr/bin
+          	$(INSTALL_BIN) $(PKG_BUILD_DIR)/src/amtc $(1)/usr/bin/amtc
+          	$(INSTALL_DIR) $(1)/usr/share/man/man1
+          	$(INSTALL_DATA) $(PKG_BUILD_DIR)/src/man/man1/amtc.1 \
+          		$(1)/usr/share/man/man1/amtc.1
           endef
 
           $(eval $(call BuildPackage,amtc))
-          EOF
+          AMTC_MAKEFILE
 
-      - name: 生成最小 defconfig(x86/64 + amtc)
-        working-directory: immortalwrt
+            cat > "$dst/host-tools/xxd" <<'AMTC_XXD'
+          #!/usr/bin/env perl
+          #
+          # Minimal drop-in replacement for "xxd -i <infile> <outfile>" (vim-common).
+          #
+          # amtc's src/Makefile embeds all WSMan SOAP request bodies (cmd_*, wsman_*)
+          # and the usage text (amtc_usage) into the binary via:
+          #     xxd -i <file> <file>.h
+          # OpenWrt/ImmortalWrt ships its own "xxd" in staging_dir/host/bin, but that is
+          # scripts/xxdi.pl which writes to stdout and ignores the second argument, so it
+          # is not usable here. This shim keeps the upstream Makefile untouched and only
+          # needs perl, which any OpenWrt build host has anyway.
+          #
+          use strict;
+          use warnings;
+
+          my ($outfile, $infile);
+
+          if (@ARGV >= 2 && $ARGV[0] eq '-i') {
+          	# xxd -i <infile> <outfile>
+          	$infile  = $ARGV[1];
+          	$outfile = $ARGV[2];
+          } elsif (@ARGV == 1) {
+          	# xxd <infile>
+          	$infile = $ARGV[0];
+          } else {
+          	die "usage: xxd [-i] <infile> [<outfile>]\n";
+          }
+
+          die "xxd: $infile: No such file\n" unless -f $infile;
+
+          my $var = $infile;
+          $var =~ s{^.*/}{};		# strip any directory part
+          $var =~ s/[^A-Za-z0-9_]/_/g;	# keep C identifier safe
+          $var = "__$var" if $var =~ /^\d/;
+
+          open(my $fh, '<:raw', $infile) or die "xxd: cannot open $infile: $!\n";
+          local $/;
+          my $data = <$fh>;
+          close($fh);
+          my $len = length($data);
+
+          my $out;
+          if (defined $outfile) {
+          	$out = "unsigned char $var\[] = {\n";
+          } else {
+          	$out = "";
+          }
+
+          my $per_line = 12;
+          for (my $i = 0; $i < $len; $i += $per_line) {
+          	my @chunk = split //, substr($data, $i, $per_line);
+          	my $line = "  " . join(", ", map { sprintf("0x%02x", ord($_)) } @chunk);
+          	$line .= "," unless $i + $per_line >= $len;
+          	$out .= "$line\n";
+          }
+          if ($len == 0) {
+          	$out .= "  \n";
+          }
+
+          if (defined $outfile) {
+          	$out .= "};\nunsigned int $var\_len = $len;\n";
+          	open(my $ofh, '>:raw', $outfile) or die "xxd: cannot write $outfile: $!\n";
+          	print $ofh $out;
+          	close($ofh);
+          } else {
+          	binmode STDOUT;
+          	print $out;
+          }
+
+          exit 0;
+          AMTC_XXD
+            chmod +x "$dst/host-tools/xxd"
+          fi
+          ls -l "$dst" "$dst/host-tools"
+          head -n 3 "$dst/host-tools/xxd"
+
+      - name: 配置（最小 .config）
         run: |
+          set -euo pipefail
+          cd "$SDK_DIR"
+          # SDK 默认配置带 CONFIG_ALL=y（= 把全世界的包都编一遍），这里换成最小配置
+          printf '%s\n' \
+            'CONFIG_ALL=n' \
+            'CONFIG_ALL_KMODS=n' \
+            'CONFIG_ALL_NONSHARED=n' \
+            'CONFIG_PACKAGE_amtc=y' \
+            'CONFIG_PACKAGE_libcurl=y' > .config
           make defconfig
-          echo "CONFIG_TARGET_x86=y" >> .config
-          echo "CONFIG_TARGET_x86_64=y" >> .config
-          echo "CONFIG_TARGET_x86_64_DEVICE_generic=y" >> .config
-          echo "CONFIG_PACKAGE_amtc=m" >> .config
-          make defconfig
+          grep -E '^CONFIG_PACKAGE_(amtc|libcurl)=y' .config
 
-      - name: 下载依赖源码包
-        working-directory: immortalwrt
-        run: make download -j8 V=s
+      - name: 编译
+        run: |
+          set -euo pipefail
+          cd "$SDK_DIR"
+          # 包定义里的 PKG_BUILD_DEPENDS:=curl 会先把 curl（以及 openssl/zlib/nghttp2）
+          # 编好并装进 staging_dir，然后才编 amtc
+          make package/amtc/compile V=s -j"$(nproc)" 2>&1 | tee build.log
+          find bin/packages \( -name 'amtc-*.apk' -o -name 'amtc_*.ipk' \) | tee /tmp/built.txt
+          [ -s /tmp/built.txt ] || { echo "::error::没有产出 amtc 包"; exit 1; }
 
-      - name: 构建 host 工具链(sed/tar/patch 等)
-        working-directory: immortalwrt
-        run: make tools/install -j$(nproc) V=s
+      - name: 校验并写入任务摘要
+        run: |
+          set -euo pipefail
+          cd "$SDK_DIR"
+          {
+            echo "## amtc / ImmortalWrt ${IWRT_VERSION} / ${TARGET}"
+            echo
+            echo '```'
+            for f in bin/packages/*/*/amtc-*.apk; do
+              [ -e "$f" ] || continue
+              echo "== $f"
+              staging_dir/host/bin/apk adbdump "$f" | sed -n '1,22p'
+            done
+            for f in bin/packages/*/*/amtc_*.ipk; do
+              [ -e "$f" ] || continue
+              echo "== $f"; tar -tzf "$f"
+            done
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
-      - name: 构建交叉编译工具链(gcc/binutils 等)
-        working-directory: immortalwrt
-        run: make toolchain/install -j$(nproc) V=s
+      - name: 收集产物
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          find "$SDK_DIR/bin/packages" \( -name 'amtc-*.apk' -o -name 'amtc_*.ipk' \) -exec cp -v {} out/ \;
+          # 顺手带上它唯一的非 base 运行期依赖，方便离线安装
+          find "$SDK_DIR/bin/packages" \( -name 'libcurl*.apk' -o -name 'libcurl*.ipk' \) -exec cp -v {} out/ \; || true
+          ls -lh out/
 
-      - name: SSH 调试(默认关闭,仅万一失败时手动开启)
-        if: ${{ github.event.inputs.ssh_debug == 'true' }}
-        uses: lhotari/action-upterm@v1
-        timeout-minutes: 180
-        with:
-          limit-access-to-actor: true
-
-      - name: 编译 amtc 包
-        working-directory: immortalwrt
-        run: make package/amtc/compile V=s -j1
-
-      - name: 查找生成的 ipk
-        run: find immortalwrt/bin/ -name "amtc*.ipk"
-
-      - name: 上传 ipk 产物
+      - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: amtc-ipk
-          path: immortalwrt/bin/**/amtc*.ipk
+          name: amtc-${{ env.IWRT_VERSION }}-${{ env.SLUG }}
+          path: out/*
+          if-no-files-found: error
+
+      - name: 失败时保留构建日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: buildlog-${{ env.IWRT_VERSION }}-${{ env.SLUG }}
+          path: |
+            ${{ env.SDK_DIR }}/build.log
+            ${{ env.SDK_DIR }}/logs
+          if-no-files-found: ignore
