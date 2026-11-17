@@ -107,7 +107,7 @@ jobs:
       # ---- 可选调试:开启后会在这里挂起,给你 SSH 地址 ----
       - name: SSH 调试(可选)
         if: ${{ github.event.inputs.ssh_debug == 'true' }}
-        uses: mxschmitt/action-tmate@v3
+        uses: lhotari/action-upterm@v1
         timeout-minutes: 10
         with:
           limit-access-to-actor: true
