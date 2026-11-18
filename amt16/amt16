@@ -1,0 +1,348 @@
+#!/bin/sh
+# amt16 - minimal Intel AMT 9.0+ / AMT 16 WS-Man CLI for power + boot control.
+#
+# Why this exists: amtc/amtgo are abandoned, MeshCommander is EOL and
+# Intel's Device Management Toolkit is a whole service stack. AMT 9.0+ (and
+# therefore all AMT 16.x) speaks plain DMTF WS-Man over TLS on port 16993,
+# which is ~150 lines of curl. This is that.
+#
+# Requires: curl with --digest (any curl since 7.x). No other dependency.
+#
+#   export AMT_PASSWORD='...'
+#   ./amt16 info 192.168.1.88
+#   ./amt16 off  192.168.1.88 192.168.1.89
+#
+# License: MIT.
+
+VERSION=0.1.0
+
+PORT=16993
+AMT_USER=admin
+AMT_PASS=
+CACERT=
+INSECURE=1
+TIMEOUT=30
+VERBOSE=0
+
+PROG=$(basename "$0")
+
+die()  { printf '%s: %s\n' "$PROG" "$*" >&2; exit 2; }
+note() { printf '%s\n' "$*" >&2; }
+
+usage() {
+  cat <<EOF
+$PROG $VERSION - Intel AMT (9.0+/16.x) WS-Man power & boot control
+
+usage: $PROG [options] <command> <host> [host...]
+
+commands:
+  info              show current power state
+  on                power on                        (PowerState 2)
+  off               power off, hard                 (PowerState 8)
+  softoff           graceful OS shutdown            (PowerState 12)
+  cycle             power cycle                     (PowerState 5)
+  reset             reset                           (PowerState 10)
+  resetg            graceful reset                  (PowerState 14)
+  power <N>         raw RequestPowerStateChange with N
+  pxe               set next boot to PXE            (then: cycle/on)
+  hdd               set next boot to hard drive     (then: cycle/on)
+  raw <file>        POST a raw SOAP envelope (debug)
+
+options:
+  -u <user>         AMT user (default: admin)
+  -p <password>     AMT password (default: \$AMT_PASSWORD)
+  -P <port>         TLS port (default: 16993)
+  -c <cafile>       verify the AMT certificate against this CA/PEM
+  -t <seconds>      curl timeout (default: 30)
+  -v                dump request/response XML to stderr
+  -V                print version
+
+notes:
+  * TLS certificate verification is OFF by default: AMT ships a self-signed
+    cert in CCM mode. Use -c to pin it instead.
+  * AMT 16.x has no plaintext 16992/16994 ports and no legacy 2004/01 SOAP.
+  * request bodies are the same CIM payloads amtc/WS-Man tools use, only
+    with a correct <wsa:To>, 'application/soap+xml' and TLS 1.2+.
+EOF
+}
+
+# ---------------------------------------------------------------- arguments
+COMMAND=
+POWER_ARG=
+RAW_FILE=
+HOSTS=
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -V|--version) printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
+    -u) [ $# -ge 2 ] || die "-u needs an argument"; AMT_USER=$2; shift 2 ;;
+    -p) [ $# -ge 2 ] || die "-p needs an argument"; AMT_PASS=$2; shift 2 ;;
+    -P) [ $# -ge 2 ] || die "-P needs an argument"; PORT=$2; shift 2 ;;
+    -c) [ $# -ge 2 ] || die "-c needs an argument"; CACERT=$2; INSECURE=0; shift 2 ;;
+    -t) [ $# -ge 2 ] || die "-t needs an argument"; TIMEOUT=$2; shift 2 ;;
+    -v) VERBOSE=1; shift ;;
+    --) shift; break ;;
+    -*) die "unknown option: $1 (try -h)" ;;
+    *)
+      if [ -z "$COMMAND" ]; then
+        COMMAND=$1; shift
+        case "$COMMAND" in
+          power) [ $# -ge 1 ] || die "power needs a numeric PowerState"; POWER_ARG=$1; shift ;;
+          raw)   [ $# -ge 1 ] || die "raw needs a file"; RAW_FILE=$1; shift ;;
+        esac
+      else
+        HOSTS="$HOSTS $1"; shift
+      fi
+      ;;
+  esac
+done
+[ -n "$COMMAND" ] || { usage >&2; exit 2; }
+[ -n "$HOSTS" ]   || die "no host given"
+
+case "$COMMAND" in
+  info|on|off|softoff|cycle|reset|resetg|power|pxe|hdd|raw) ;;
+  *) die "unknown command: $COMMAND (try -h)" ;;
+esac
+
+[ -n "$AMT_PASS" ] || AMT_PASS=$AMT_PASSWORD
+if [ -z "$AMT_PASS" ]; then
+  if [ -t 0 ]; then
+    printf 'AMT password for %s: ' "$AMT_USER" >&2
+    stty -echo 2>/dev/null; read -r AMT_PASS; stty echo 2>/dev/null; printf '\n' >&2
+  fi
+fi
+[ -n "$AMT_PASS" ] || die "no password: set AMT_PASSWORD or pass -p"
+if [ "$COMMAND" = raw ]; then
+  [ -r "$RAW_FILE" ] || die "cannot read $RAW_FILE"
+fi
+
+# ------------------------------------------------------------------ helpers
+gen_uuid() {
+  h=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+  [ ${#h} -eq 32 ] || h=0123456789abcdef0123456789abcdef
+  printf '%s-%s-4%s-a%s-%s' \
+    "$(printf %s "$h" | cut -c1-8)"  "$(printf %s "$h" | cut -c9-12)" \
+    "$(printf %s "$h" | cut -c14-16)" "$(printf %s "$h" | cut -c18-20)" \
+    "$(printf %s "$h" | cut -c21-32)"
+}
+
+# strip namespace prefixes and newlines: <h:PowerState> -> <PowerState>
+normalize() {
+  tr '\n\r' '  ' | sed -e 's#<\(/\{0,1\}\)[A-Za-z0-9_.-]\{1,\}:\([A-Za-z]\)#<\1\2#g'
+}
+
+# xml_get <normalized-response> <tag>
+xml_get() {  # first <tag>value</tag> (tag may carry attributes)
+  printf '%s' "$1" | grep -o "<$2[^>]*>[^<]*</$2>" | head -n 1 | sed "s:^<$2[^>]*>::; s:</$2>$::"
+}
+
+powerstate_name() {
+  case "$1" in
+    2)  echo on ;;
+    3)  echo sleep-light ;;
+    4)  echo sleep-deep ;;
+    5)  echo power-cycle-soft ;;
+    6)  echo off-hard ;;
+    7)  echo hibernate ;;
+    8)  echo off-soft ;;
+    9)  echo power-cycle-hard ;;
+    10) echo reset ;;
+    11) echo nmi ;;
+    12) echo off-soft-graceful ;;
+    13) echo off-hard-graceful ;;
+    14) echo reset-graceful ;;
+    15) echo power-cycle-soft-graceful ;;
+    16) echo power-cycle-hard-graceful ;;
+    0)  echo unknown ;;
+    *)  echo "state-$1" ;;
+  esac
+}
+
+# ------------------------------------------------------------- SOAP plumbing
+# envelope <action> <resource-uri> <extra-header-xml> <body-xml>
+envelope() {
+  cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:wsman="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd" xmlns:wsen="http://schemas.xmlsoap.org/ws/2004/09/enumeration" xmlns:n1="$2">
+<s:Header>
+<wsa:Action s:mustUnderstand="true">$1</wsa:Action>
+<wsa:To s:mustUnderstand="true">$AMT_TO</wsa:To>
+<wsman:ResourceURI s:mustUnderstand="true">$2</wsman:ResourceURI>
+<wsa:MessageID s:mustUnderstand="true">uuid:$(gen_uuid)</wsa:MessageID>
+<wsa:ReplyTo><wsa:Address>http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</wsa:Address></wsa:ReplyTo>
+$3
+</s:Header>
+<s:Body>
+$4
+</s:Body>
+</s:Envelope>
+EOF
+}
+
+# ws_post <request-file> <response-file> -> echoes http status, 000 on failure
+ws_post() {
+  if [ "$INSECURE" -eq 1 ]; then
+    tlsopt="-k"
+  else
+    tlsopt="--cacert $CACERT"
+  fi
+  # shellcheck disable=SC2086
+  status=$(curl -sS --max-time "$TIMEOUT" --digest -u "$AMT_USER:$AMT_PASS" $tlsopt \
+      -H 'Content-Type: application/soap+xml;charset=UTF-8' \
+      -o "$2" -w '%{http_code}' --data-binary "@$1" "$AMT_URL" 2>"$2.err")
+  rc=$?
+  [ "$rc" -ne 0 ] && status=000   # reasons land in <respfile>.err
+  printf '%s' "$status"
+}
+
+fault_text() { # $1 = normalized response
+  vals=$(printf '%s' "$1" | grep -o '<Value>[^<]*</Value>' | sed 's:^<Value>::; s:</Value>$::')
+  code=$(printf '%s\n' "$vals" | sed '/^$/d' | tail -n 1)
+  [ -n "$code" ] || code=$(xml_get "$1" faultcode)
+  txt=$(xml_get "$1" Text)
+  [ -n "$txt" ] || txt=$(xml_get "$1" faultstring)
+  [ -n "$txt" ] || txt=$(xml_get "$1" Reason)
+  [ -n "$txt" ] || txt=$(printf '%s' "$1" | sed -n 's:.*<s:Detail>\([^<]*\)</s:Detail>.*:\1:p')
+  printf '%s%s' "${code:+$code: }" "${txt:-unknown fault}"
+}
+
+# call <action> <resource-uri> <header-xml> <body-xml>
+# echoes the normalized response on success, returns 0; prints error, returns 1
+call() {
+  rq="$TMP/rq.xml"; rs="$TMP/rs.xml"
+  envelope "$1" "$2" "$3" "$4" > "$rq"
+  if [ "$VERBOSE" -eq 1 ]; then
+    printf -- '--- request  -> %s\n' "$AMT_URL" >&2
+    cat "$rq" >&2
+  fi
+  st=$(ws_post "$rq" "$rs")
+  CURL_ERR=$(sed 's/^curl: //' "$rs.err" 2>/dev/null | tr '\n' ' ' \
+             | sed -e 's/More details here.*//' -e 's/curl failed to verify.*//' -e 's/  *$//' | cut -c1-160)
+  if [ -f "$rs" ]; then n=$(normalize < "$rs" 2>/dev/null); else n=; fi
+  if [ "$VERBOSE" -eq 1 ]; then
+    printf -- '--- response (%s)\n%s\n' "$st" "$n" >&2
+  fi
+  case "$st" in
+    200)
+      if [ -n "$(printf '%s' "$n" | grep -o '<Fault>')" ]; then
+        printf '%s\n' "$(fault_text "$n")"
+        return 1
+      fi
+      printf '%s\n' "$n"
+      return 0 ;;
+    401) printf 'authentication failed (401) - check user/password, or the account is locked/ACL-denied\n'; return 1 ;;
+    404) printf 'HTTP 404 - no WS-Man endpoint on %s (AMT 16 has no legacy SOAP; check the port/TLS setting in MEBx)\n' "$AMT_URL"; return 1 ;;
+    000)
+      case "$CURL_ERR" in
+        *certificate*|*SSL*|*ssl*|*TLS*)
+          printf 'TLS handshake failed%s\n    hint: AMT ships a self-signed cert; drop -c, or pin the right one with -c amt.pem\n' "${CURL_ERR:+
+    $CURL_ERR}" ;;
+        *) printf 'connection failed - is %s reachable and AMT TLS enabled on port %s?%s\n' \
+             "$AMT_HOST" "$PORT" "${CURL_ERR:+
+    $CURL_ERR}" ;;
+      esac
+      return 1 ;;
+    *)   printf 'HTTP %s from %s%s\n' "$st" "$AMT_URL" "${n:+: $(printf '%s' "$n" | cut -c1-200)}"; return 1 ;;
+  esac
+}
+
+BOOT_CFG_SELECTORS='<wsman:SelectorSet><wsman:Selector Name="InstanceID">Intel(r) AMT: Boot Configuration 0</wsman:Selector></wsman:SelectorSet>'
+PMS_SELECTORS='<wsman:SelectorSet><wsman:Selector Name="Name">Intel(r) AMT Power Management Service</wsman:Selector><wsman:Selector Name="SystemName">Intel(r) AMT</wsman:Selector><wsman:Selector Name="CreationClassName">CIM_PowerManagementService</wsman:Selector><wsman:Selector Name="SystemCreationClassName">CIM_ComputerSystem</wsman:Selector></wsman:SelectorSet>'
+CIM_PMS=http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_PowerManagementService
+CIM_APMS=http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_AssociatedPowerManagementService
+CIM_BCS=http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_BootConfigSetting
+
+request_power_state() { # $1 = PowerState
+  body="<n1:RequestPowerStateChange_INPUT><n1:PowerState>$1</n1:PowerState><n1:ManagedElement><wsa:Address>http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</wsa:Address><wsa:ReferenceParameters><wsman:ResourceURI>http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_ComputerSystem</wsman:ResourceURI><wsman:SelectorSet><wsman:Selector Name=\"Name\">ManagedSystem</wsman:Selector><wsman:Selector Name=\"CreationClassName\">CIM_ComputerSystem</wsman:Selector></wsman:SelectorSet></wsa:ReferenceParameters></n1:ManagedElement></n1:RequestPowerStateChange_INPUT>"
+  out=$(call "$CIM_PMS/RequestPowerStateChange" "$CIM_PMS" "$PMS_SELECTORS" "$body") || { printf '    %s\n' "$out"; return 1; }
+  rv=$(xml_get "$out" "ReturnValue")
+  case "$rv" in
+    0) return 0 ;;
+    *) printf '    RequestPowerStateChange returned %s\n' "${rv:-?}"; return 1 ;;
+  esac
+}
+
+change_boot_order() { # $1 = boot source InstanceID
+  body="<n1:ChangeBootOrder_INPUT><n1:Source><wsa:Address>http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</wsa:Address><wsa:ReferenceParameters><wsman:ResourceURI>http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_BootSourceSetting</wsman:ResourceURI><wsman:SelectorSet><wsman:Selector Name=\"InstanceID\">$1</wsman:Selector></wsman:SelectorSet></wsa:ReferenceParameters></n1:Source></n1:ChangeBootOrder_INPUT>"
+  out=$(call "$CIM_BCS/ChangeBootOrder" "$CIM_BCS" "$BOOT_CFG_SELECTORS" "$body") || { printf '    %s\n' "$out"; return 1; }
+  rv=$(xml_get "$out" "ReturnValue")
+  case "$rv" in
+    0) return 0 ;;
+    *) printf '    ChangeBootOrder returned %s\n' "${rv:-?}"; return 1 ;;
+  esac
+}
+
+show_info() {
+  out=$(call "http://schemas.xmlsoap.org/ws/2004/09/enumeration/Enumerate" "$CIM_APMS" "" \
+        '<wsen:Enumerate><wsman:OptimizeEnumeration/><wsman:EnumerationMode>EnumerateObjectAndEPR</wsman:EnumerationMode><wsman:MaxElements>250</wsman:MaxElements></wsen:Enumerate>') \
+    || { printf '%s\n' "    $out"; return 1; }
+
+  ps=$(xml_get "$out" "PowerState")
+  if [ -z "$ps" ]; then
+    ctx=$(xml_get "$out" "EnumerationContext")
+    if [ -z "$ctx" ]; then
+      printf '    no PowerState in enumeration response and no EnumerationContext\n'
+      return 1
+    fi
+    out=$(call "http://schemas.xmlsoap.org/ws/2004/09/enumeration/Pull" "$CIM_APMS" "" \
+          "<wsen:Pull><wsen:EnumerationContext>$ctx</wsen:EnumerationContext><wsen:MaxElements>250</wsen:MaxElements></wsen:Pull>") \
+      || { printf '%s\n' "    $out"; return 1; }
+    ps=$(xml_get "$out" "PowerState")
+  fi
+  [ -n "$ps" ] || { printf '    could not parse PowerState\n'; return 1; }
+
+  avail=$(xml_get "$out" "AvailableRequestedPowerStates")
+  printf '    power=%s (%s)%s\n' "$(powerstate_name "$ps")" "$ps" "${avail:+  available=$avail}"
+  return 0
+}
+
+# ---------------------------------------------------------------- per-host
+run_host() {
+  AMT_HOST=$1
+  AMT_TO="https://$AMT_HOST:$PORT/wsman"
+  AMT_URL="$AMT_TO"
+  TMP="$TMPROOT/$AMT_HOST"
+  mkdir -p "$TMP"
+
+  case "$COMMAND" in
+    info)    show_info ;;
+    on)      request_power_state 2 ;;
+    off)     request_power_state 8 ;;
+    softoff) request_power_state 12 ;;
+    cycle)   request_power_state 5 ;;
+    reset)   request_power_state 10 ;;
+    resetg)  request_power_state 14 ;;
+    power)
+      case "$POWER_ARG" in
+        ''|*[!0-9]*) printf '    power needs a numeric PowerState\n'; return 1 ;;
+      esac
+      request_power_state "$POWER_ARG" ;;
+    pxe)     change_boot_order 'Intel(r) AMT: Force PXE Boot' ;;
+    hdd)     change_boot_order 'Intel(r) AMT: Force Hard-drive Boot' ;;
+    raw)
+      rs="$TMP/rs.xml"
+      st=$(ws_post "$RAW_FILE" "$rs")
+      if [ -f "$rs" ]; then n=$(normalize < "$rs" 2>/dev/null); else n=; fi
+      printf '    HTTP %s\n%s\n' "$st" "$n"
+      [ "$st" = 200 ] ;;
+  esac
+}
+
+TMPROOT=$(mktemp -d 2>/dev/null || printf '/tmp/amt16.%s' "$$")
+mkdir -p "$TMPROOT"
+trap 'rm -rf "$TMPROOT"' EXIT INT TERM
+
+fails=0
+for h in $HOSTS; do
+  printf '== %s\n' "$h"
+  if run_host "$h"; then
+    [ "$COMMAND" = info ] || printf '    ok\n'
+  else
+    printf '    FAILED\n'
+    fails=$((fails + 1))
+  fi
+done
+
+[ "$fails" -eq 0 ] || exit 1
+exit 0
